@@ -1,0 +1,63 @@
+services:
+  # Auth Service
+  auth:
+    build: ./auth-service
+    container_name: docs_auth
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 4000
+      DB_HOST: infra_postgres
+      DB_PORT: 5432
+      DB_NAME: docs_portal
+      DB_USER: docs_user
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: 7d
+      JWT_REFRESH_EXPIRES_IN: 30d
+      CORS_ORIGIN: ${DOCS_URL:-http://localhost:3000}
+      SUPERUSER_EMAIL: ${SUPERUSER_EMAIL:-admin@docs.local}
+      SUPERUSER_PASSWORD: ${SUPERUSER_PASSWORD:-changeme123}
+      SUPERUSER_NAME: ${SUPERUSER_NAME:-Super Admin}
+    ports:
+      - "${AUTH_PORT:-4000}:4000"
+    networks:
+      - docs_network
+      - infra_network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Docusaurus (build and serve)
+  docs:
+    build:
+      context: ./docusaurus
+      dockerfile: Dockerfile
+    container_name: docs_portal
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      AUTH_SERVICE_URL: http://auth:4000
+    ports:
+      - "${DOCS_PORT:-3000}:3000"
+    networks:
+      - docs_network
+    depends_on:
+      auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  docs_network:
+    name: docs_network
+    driver: bridge
+  infra_network:
+    external: true
+    name: infra_network
