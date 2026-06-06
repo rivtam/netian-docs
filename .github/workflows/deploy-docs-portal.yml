@@ -1,0 +1,143 @@
+name: Deploy Docs Portal
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  # ─── Build and Push Docker Images ─────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for auth-service
+        id: meta-auth
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/auth-service
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push auth-service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./auth-service
+          push: true
+          tags: ${{ steps.meta-auth.outputs.tags }}
+          labels: ${{ steps.meta-auth.outputs.labels }}
+
+      - name: Extract metadata for docusaurus
+        id: meta-docs
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/docusaurus
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push docusaurus
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docusaurus
+          push: true
+          tags: ${{ steps.meta-docs.outputs.tags }}
+          labels: ${{ steps.meta-docs.outputs.labels }}
+
+  # ─── Deploy to Mac Mini Server ────────────────────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TS_AUTH_KEY }}
+          tags: tag:ci
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+
+            DOCS_DIR="${HOME}/prod/docs-portal"
+
+            # Create directory if it doesn't exist
+            mkdir -p "$DOCS_DIR"
+            cd "$DOCS_DIR"
+
+            # Pull latest changes
+            if [ -d ".git" ]; then
+              git fetch origin main
+              git reset --hard origin/main
+            else
+              git clone ${{ github.server_url }}/${{ github.repository }}.git .
+            fi
+
+            # Create .env if it doesn't exist
+            if [ ! -f ".env" ]; then
+              echo "⚠️  Creating .env from .env.example"
+              cp .env.example .env
+              echo "⚠️  IMPORTANT: Update .env with production values!"
+            fi
+
+            # Log in to GitHub Container Registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull latest images
+            docker compose pull
+
+            # Run database migrations
+            echo "📦 Running database migrations..."
+            cd database/migrations
+            npm ci
+            node migrate.js
+            cd ../..
+
+            # Restart services
+            echo "🚀 Restarting services..."
+            docker compose up -d
+
+            # Wait for services to be healthy
+            echo "⏳ Waiting for services to be healthy..."
+            timeout 120 bash -c 'until docker compose ps | grep -q "healthy"; do sleep 2; done' || echo "⚠️  Health check timeout"
+
+            # Health check
+            echo "🏥 Checking service health..."
+            docker compose ps
+
+            # Cleanup old images
+            docker image prune -f
+
+            echo "✅ Deployment complete!"
+
+      - name: Deployment status notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Docs Portal deployment successful!"
+          else
+            echo "❌ Docs Portal deployment failed!"
+          fi
